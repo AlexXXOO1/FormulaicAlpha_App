@@ -1,3 +1,39 @@
+"""
+WorldQuant 101 Formulaic Alphas - Alpha#001.
+
+Paper formula:
+    Alpha#001 =
+        rank(
+            ts_argmax(
+                signedpower(
+                    where(returns < 0, stddev(returns, 20), close),
+                    2
+                ),
+                5
+            )
+        ) - 0.5
+
+Required paper-level input fields:
+    symbol
+    date
+    close
+    returns
+
+Factor meaning:
+    Alpha#001 combines short-term return direction, recent return volatility,
+    and the timing of the maximum squared signal within a 5-day window.
+
+    If returns < 0, it uses 20-day return volatility.
+    Otherwise, it uses close price.
+
+    The final value is cross-sectionally ranked by date and shifted by -0.5,
+    so the theoretical output range is approximately (-0.5, 0.5].
+
+Usage in this project:
+    The factor is computed from T0 and historical data only.
+    It is valid for later T+1 / T+2 / T+3 forward-return validation.
+"""
+
 from __future__ import annotations
 
 import numpy as np
@@ -17,30 +53,24 @@ def compute_alpha_001(
     symbol_col: str = "symbol",
     date_col: str = "date",
     close_col: str = "close",
+    returns_col: str = "returns",
     output_col: str = ALPHA_NAME,
 ) -> pd.DataFrame:
-    """
-    Alpha#001:
-        rank(ts_argmax(signedpower(where(returns < 0, stddev(returns, 20), close), 2), 5)) - 0.5
-
-    Required columns:
-        symbol, date, close
-
-    Output:
-        symbol, date, alpha_001
-    """
-    required = {symbol_col, date_col, close_col}
+    required = {symbol_col, date_col, close_col, returns_col}
     missing = sorted(required - set(market_df.columns))
     if missing:
         raise ValueError(f"Missing required columns for alpha_001: {missing}")
 
-    df = market_df[[symbol_col, date_col, close_col]].copy()
+    df = market_df[[symbol_col, date_col, close_col, returns_col]].copy()
+
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
     df[close_col] = pd.to_numeric(df[close_col], errors="coerce")
+    df[returns_col] = pd.to_numeric(df[returns_col], errors="coerce")
+
     df = df.dropna(subset=[symbol_col, date_col, close_col])
     df = df.sort_values([symbol_col, date_col], kind="mergesort").reset_index(drop=True)
 
-    df["_returns"] = df.groupby(symbol_col, sort=False)[close_col].pct_change()
+    df["_returns"] = df[returns_col]
     df["_stddev_returns_20"] = rolling_std_by_symbol(df, "_returns", 20, symbol_col=symbol_col)
 
     base = np.where(

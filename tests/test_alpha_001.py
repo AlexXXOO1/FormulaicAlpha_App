@@ -17,6 +17,9 @@ def test_alpha_001_basic_output():
             })
 
     df = pd.DataFrame(rows)
+    df = df.sort_values(["symbol", "date"], kind="mergesort").reset_index(drop=True)
+    df["returns"] = df.groupby("symbol", sort=False)["close"].pct_change()
+
     out = compute_alpha_001(df)
 
     assert list(out.columns) == ["symbol", "date", "alpha_001"]
