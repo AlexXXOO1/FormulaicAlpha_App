@@ -73,6 +73,50 @@ def infer_symbol_from_path(path: Path) -> str:
     raise ValueError(f"Cannot infer symbol from file name: {path.name}")
 
 
+def read_normalized_metadata(text: str) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+
+    for line in text.splitlines():
+        line = line.strip().lstrip("\ufeff")
+
+        if not line.startswith("#"):
+            continue
+
+        payload = line.lstrip("#").strip()
+
+        if "=" not in payload:
+            continue
+
+        key, value = payload.split("=", 1)
+        metadata[key.strip()] = value.strip()
+
+    return metadata
+
+
+def assert_normalized_metadata_matches(
+    path: Path,
+    symbol: str,
+    price_basis: str,
+    text: str,
+) -> None:
+    metadata = read_normalized_metadata(text)
+
+    existing_symbol = metadata.get("symbol")
+    if existing_symbol and existing_symbol.upper() != symbol.upper():
+        raise ValueError(
+            f"Normalized TXT symbol mismatch in {path}: "
+            f"metadata symbol={existing_symbol}, filename symbol={symbol}"
+        )
+
+    existing_price_basis = metadata.get("price_basis")
+    if existing_price_basis and existing_price_basis != price_basis:
+        raise ValueError(
+            f"Normalized TXT price_basis mismatch in {path}: "
+            f"metadata price_basis={existing_price_basis}, expected={price_basis}. "
+            f"Check whether adjusted and unadjusted files were put into the wrong folder."
+        )
+
+
 def normalize_tdx_txt_file(path: Path, price_basis: str) -> dict[str, object]:
     path = Path(path)
     symbol = infer_symbol_from_path(path)
@@ -81,6 +125,8 @@ def normalize_tdx_txt_file(path: Path, price_basis: str) -> dict[str, object]:
     data_rows = sum(1 for line in text.splitlines() if DATE_LINE_RE.match(line.strip()))
 
     if NORMALIZED_MARKER in text:
+        assert_normalized_metadata_matches(path, symbol, price_basis, text)
+
         return {
             "path": str(path),
             "symbol": symbol,
@@ -225,6 +271,148 @@ def parse_tdx_txt_file(path: Path) -> pd.DataFrame:
         raise ValueError(f"Invalid OHLCV rows in {path}:\n{sample.to_string(index=False)}")
 
     return df
+
+
+def validate_adjusted_unadjusted_pair(
+    adjusted_df: pd.DataFrame,
+    unadjusted_df: pd.DataFrame,
+    *,
+    adjusted_file: Path,
+    unadjusted_file: Path,
+) -> None:
+    if adjusted_file.resolve() == unadjusted_file.resolve():
+        raise ValueError(
+            f"Adjusted and unadjusted inputs point to the same file: {adjusted_file}"
+        )
+
+    adjusted_symbols = set(adjusted_df["symbol"].astype(str).unique())
+    unadjusted_symbols = set(unadjusted_df["symbol"].astype(str).unique())
+
+    if adjusted_symbols != unadjusted_symbols:
+        raise ValueError(
+            f"Adjusted/unadjusted symbol mismatch: "
+            f"adjusted={sorted(adjusted_symbols)}, unadjusted={sorted(unadjusted_symbols)}"
+        )
+
+    adjusted_dates = set(pd.to_datetime(adjusted_df["date"]).dt.normalize())
+    unadjusted_dates = set(pd.to_datetime(unadjusted_df["date"]).dt.normalize())
+
+    missing_unadjusted_dates = sorted(adjusted_dates - unadjusted_dates)
+    extra_unadjusted_dates = sorted(unadjusted_dates - adjusted_dates)
+
+    if missing_unadjusted_dates or extra_unadjusted_dates:
+        raise ValueError(
+            "Adjusted/unadjusted date set mismatch. "
+            f"missing_unadjusted_first_5={missing_unadjusted_dates[:5]}, "
+            f"extra_unadjusted_first_5={extra_unadjusted_dates[:5]}"
+        )
+
+    adjusted = adjusted_df[
+        ["symbol", "date", "close", "volume", "amount"]
+    ].rename(
+        columns={
+            "close": "adjusted_close",
+            "volume": "adjusted_volume",
+            "amount": "adjusted_amount",
+        }
+    )
+
+    unadjusted = unadjusted_df[
+        ["symbol", "date", "close", "volume", "amount"]
+    ].rename(
+        columns={
+            "close": "unadjusted_close",
+            "volume": "unadjusted_volume",
+            "amount": "unadjusted_amount",
+        }
+    )
+
+    pair = adjusted.merge(
+        unadjusted,
+        on=["symbol", "date"],
+        how="inner",
+        validate="one_to_one",
+    )
+
+    if pair.empty:
+        raise ValueError("Adjusted/unadjusted merge is empty.")
+
+    volume_diff = (pair["adjusted_volume"] - pair["unadjusted_volume"]).abs()
+    volume_tol = pair["unadjusted_volume"].abs().clip(lower=1.0) * 1e-8
+
+    if (volume_diff > volume_tol).any():
+        sample = pair.loc[
+            volume_diff > volume_tol,
+            ["symbol", "date", "adjusted_volume", "unadjusted_volume"],
+        ].head(10)
+        raise ValueError(
+            "Adjusted/unadjusted volume mismatch. "
+            "Check whether the two TXT files are from the same vendor export/date range.\n"
+            + sample.to_string(index=False)
+        )
+
+    amount_diff = (pair["adjusted_amount"] - pair["unadjusted_amount"]).abs()
+    amount_tol = pair["unadjusted_amount"].abs().clip(lower=1.0) * 1e-6
+
+    if (amount_diff > amount_tol).any():
+        sample = pair.loc[
+            amount_diff > amount_tol,
+            ["symbol", "date", "adjusted_amount", "unadjusted_amount"],
+        ].head(10)
+        raise ValueError(
+            "Adjusted/unadjusted amount mismatch. "
+            "Check whether the two TXT files are from the same vendor export/date range.\n"
+            + sample.to_string(index=False)
+        )
+
+    factor = pair["adjusted_close"] / pair["unadjusted_close"]
+
+    invalid_factor = factor.isna() | (factor <= 0)
+    if invalid_factor.any():
+        sample = pair.loc[
+            invalid_factor,
+            ["symbol", "date", "adjusted_close", "unadjusted_close"],
+        ].head(10)
+        raise ValueError(
+            "Invalid adjustment_factor detected.\n"
+            + sample.to_string(index=False)
+        )
+
+    latest_date = pair["date"].max()
+    latest_factor = float(factor.loc[pair["date"].eq(latest_date)].median())
+
+    # TDX forward-adjusted OHLC should be anchored near the latest unadjusted close.
+    # If this is far from 1, the files are probably swapped or not the expected price basis.
+    if latest_factor < 0.95 or latest_factor > 1.05:
+        raise ValueError(
+            f"Latest adjustment_factor is not near 1.0: {latest_factor:.6f}. "
+            "Expected forward-adjusted OHLC + unadjusted OHLCV. "
+            "Check whether adjusted/unadjusted files were swapped."
+        )
+
+    high_factor_ratio = float((factor > 1.02).mean())
+
+    # Forward-adjusted factor should normally be <= 1, allowing small rounding tolerance.
+    # A large share above 1 usually means adjusted/unadjusted inputs are swapped.
+    if high_factor_ratio > 0.05:
+        sample = pair.loc[
+            factor > 1.02,
+            ["symbol", "date", "adjusted_close", "unadjusted_close"],
+        ].head(10)
+        raise ValueError(
+            f"Too many adjustment_factor values above 1.02: ratio={high_factor_ratio:.4f}. "
+            "This usually means the adjusted and unadjusted files were swapped.\n"
+            + sample.to_string(index=False)
+        )
+
+    if bool((pair["adjusted_close"] == pair["unadjusted_close"]).all()):
+        print(
+            "[WARNING] adjusted_close equals unadjusted_close for all rows. "
+            "This may be valid for symbols without corporate actions, but verify manually "
+            "if this symbol should have adjustment history."
+        )
+
+
 
 
 def merge_adjusted_ohlc_and_unadjusted_ohlcv(
@@ -391,6 +579,13 @@ def import_tdx_txt_to_daily_parquet(
 
             adjusted_df = parse_tdx_txt_file(adjusted_file)
             unadjusted_df = parse_tdx_txt_file(unadjusted_file)
+
+            validate_adjusted_unadjusted_pair(
+                adjusted_df,
+                unadjusted_df,
+                adjusted_file=adjusted_file,
+                unadjusted_file=unadjusted_file,
+            )
 
             new_df = merge_adjusted_ohlc_and_unadjusted_ohlcv(adjusted_df, unadjusted_df)
 
