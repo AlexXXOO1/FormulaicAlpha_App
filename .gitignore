@@ -1,0 +1,32 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime logs
+*.log
+
+# Local data should stay outside git
+FormulaicAlpha_Data/
+data_engine/raw_data/
+data_engine/**/*.parquet
+data_engine/**/*.csv
+
+# Research / backtest outputs
+research/**/output/
+backtest_output/
+research_output/
+logs/
