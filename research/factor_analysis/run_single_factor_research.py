@@ -7,7 +7,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from research.factor_analysis.analyze_single_factor import run_single_factor_analysis
+from research.factor_analysis.analyze_single_factor import (
+    analyze_target,
+    analyze_target_by_year,
+    assign_global_quantile_buckets,
+    run_single_factor_analysis,
+)
 from research.factor_analysis.diagnose_single_factor_result import (
     diagnose_single_factor_result,
     infer_bucket_col,
@@ -36,21 +41,34 @@ def move_output(src: Path, dst: Path) -> None:
         shutil.move(str(src), str(dst))
 
 
+
 def read_factor_dir(factor_dir: Path, factor_col: str) -> pd.DataFrame:
     files = sorted(factor_dir.glob("*.parquet"))
     if not files:
         raise FileNotFoundError(f"No factor parquet files found: {factor_dir}")
 
     parts = []
+
     for i, p in enumerate(files, start=1):
         if i % 500 == 0 or i == len(files):
             print(f"loading factor {i}/{len(files)}")
-        parts.append(pd.read_parquet(p, columns=["symbol", "date", factor_col]))
 
-    df = pd.concat(parts, ignore_index=True)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
-    df[factor_col] = pd.to_numeric(df[factor_col], errors="coerce")
-    return df
+        try:
+            df = pd.read_parquet(p, columns=["symbol", "date", factor_col])
+        except Exception:
+            df = pd.read_parquet(p, columns=["date", factor_col])
+            df.insert(0, "symbol", p.stem)
+
+        if "symbol" not in df.columns:
+            df.insert(0, "symbol", p.stem)
+
+        df["symbol"] = df["symbol"].fillna(p.stem).astype(str)
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+        df[factor_col] = pd.to_numeric(df[factor_col], errors="coerce")
+
+        parts.append(df[["symbol", "date", factor_col]])
+
+    return pd.concat(parts, ignore_index=True)
 
 
 def write_step1_input_validation(
@@ -125,7 +143,7 @@ def write_step2_factor_distribution(
     daily = (
         factor_df.groupby("date")
         .agg(
-            row_count=("symbol", "size"),
+            row_count=(factor_col, "size"),
             non_null_count=(factor_col, lambda x: int(x.notna().sum())),
         )
         .reset_index()
@@ -547,6 +565,210 @@ def write_step8_custom_regime(
     )
 
 
+
+
+def build_shared_analysis_frame(
+    *,
+    market_dir: Path,
+    factor_dir: Path,
+    factor_col: str,
+    research_horizons: list[int],
+    trade_horizons: list[int],
+) -> pd.DataFrame:
+    market_files = {p.stem: p for p in sorted(market_dir.glob("*.parquet"))}
+    factor_files = {p.stem: p for p in sorted(factor_dir.glob("*.parquet"))}
+
+    common_symbols = sorted(set(market_files) & set(factor_files))
+
+    if not common_symbols:
+        raise ValueError("No overlapping market/factor parquet symbols.")
+
+    for h in trade_horizons:
+        if h <= 1:
+            raise ValueError(
+                "T+1 open entry requires trade horizon >= 2 because A-share positions "
+                "bought at T+1 open cannot be sold on T+1."
+            )
+
+    parts = []
+
+    for i, symbol in enumerate(common_symbols, start=1):
+        if i % 200 == 0 or i == len(common_symbols):
+            pct = i / len(common_symbols) * 100.0
+            print(f"building shared analysis frame: {i}/{len(common_symbols)} {pct:6.2f}%")
+
+        market = pd.read_parquet(
+            market_files[symbol],
+            columns=["date", "adjusted_open", "adjusted_close"],
+        )
+
+        factor = pd.read_parquet(
+            factor_files[symbol],
+            columns=["date", factor_col],
+        )
+
+        market["date"] = pd.to_datetime(market["date"], errors="coerce").dt.normalize()
+        factor["date"] = pd.to_datetime(factor["date"], errors="coerce").dt.normalize()
+
+        market["adjusted_open"] = pd.to_numeric(market["adjusted_open"], errors="coerce")
+        market["adjusted_close"] = pd.to_numeric(market["adjusted_close"], errors="coerce")
+        factor[factor_col] = pd.to_numeric(factor[factor_col], errors="coerce")
+
+        market = market.dropna(subset=["date", "adjusted_open", "adjusted_close"])
+        factor = factor.dropna(subset=["date"])
+
+        market = market.drop_duplicates(subset=["date"], keep="last")
+        factor = factor.drop_duplicates(subset=["date"], keep="last")
+
+        part = market.merge(
+            factor,
+            on="date",
+            how="inner",
+            validate="one_to_one",
+        )
+
+        part["symbol"] = symbol
+
+        part = part.sort_values("date", kind="mergesort").reset_index(drop=True)
+
+        for h in research_horizons:
+            future_close = part["adjusted_close"].shift(-h)
+            part[f"research_fwd_return_pct_T{h}"] = (
+                future_close / part["adjusted_close"] - 1.0
+            ) * 100.0
+
+        t1_open = part["adjusted_open"].shift(-1)
+
+        for h in trade_horizons:
+            exit_close = part["adjusted_close"].shift(-h)
+            part[f"trade_fwd_return_pct_T{h}"] = (
+                exit_close / t1_open - 1.0
+            ) * 100.0
+
+        value_cols = (
+            ["date", factor_col]
+            + [f"research_fwd_return_pct_T{h}" for h in research_horizons]
+            + [f"trade_fwd_return_pct_T{h}" for h in trade_horizons]
+        )
+
+        selected = part[value_cols].copy()
+        selected.insert(0, "symbol", symbol)
+
+        parts.append(selected)
+
+    out = pd.concat(parts, ignore_index=True)
+
+    if "symbol" not in out.columns:
+        raise RuntimeError(f"shared analysis frame missing symbol column. columns={out.columns.tolist()}")
+
+    out = out.sort_values(["symbol", "date"], kind="mergesort").reset_index(drop=True)
+
+    return out
+
+
+def write_mode_outputs_from_shared_frame(
+    *,
+    shared: pd.DataFrame,
+    factor_col: str,
+    factor_name: str,
+    output_dir: Path,
+    step: int,
+    prefix: str,
+    mode_prefix: str,
+    horizons: list[int],
+    write_member_detail: bool,
+) -> dict[str, Path]:
+    bucket_col = f"{factor_col}_bucket"
+
+    bucket_parts = []
+    yearly_bucket_parts = []
+    ic_parts = []
+
+    for h in horizons:
+        source_col = f"{mode_prefix}_fwd_return_pct_T{h}"
+        target_col = f"fwd_return_pct_T{h}"
+
+        work = shared[["symbol", "date", factor_col, bucket_col, source_col]].rename(
+            columns={source_col: target_col}
+        )
+
+        bucket_summary, daily_ic = analyze_target(
+            work,
+            factor_col=factor_col,
+            bucket_col=bucket_col,
+            target_col=target_col,
+            date_col="date",
+        )
+
+        yearly_bucket = analyze_target_by_year(
+            work,
+            factor_col=factor_col,
+            bucket_col=bucket_col,
+            target_col=target_col,
+            date_col="date",
+        )
+
+        if not bucket_summary.empty:
+            if "target" not in bucket_summary.columns:
+                bucket_summary.insert(0, "target", target_col)
+            else:
+                bucket_summary["target"] = target_col
+            bucket_parts.append(bucket_summary)
+
+        if not daily_ic.empty:
+            if "target" not in daily_ic.columns:
+                daily_ic.insert(0, "target", target_col)
+            else:
+                daily_ic["target"] = target_col
+            ic_parts.append(daily_ic)
+
+        if not yearly_bucket.empty:
+            if "target" not in yearly_bucket.columns:
+                yearly_bucket.insert(0, "target", target_col)
+            else:
+                yearly_bucket["target"] = target_col
+            yearly_bucket_parts.append(yearly_bucket)
+
+    bucket_all = pd.concat(bucket_parts, ignore_index=True) if bucket_parts else pd.DataFrame()
+    ic_all = pd.concat(ic_parts, ignore_index=True) if ic_parts else pd.DataFrame()
+    yearly_bucket_all = (
+        pd.concat(yearly_bucket_parts, ignore_index=True)
+        if yearly_bucket_parts
+        else pd.DataFrame()
+    )
+
+    bucket_path = step_file(output_dir, step, factor_name, f"{prefix}_bucket_summary")
+    daily_ic_path = step_file(output_dir, step, factor_name, f"{prefix}_daily_ic")
+    yearly_bucket_path = step_file(output_dir, step, factor_name, f"{prefix}_yearly_bucket_summary")
+
+    bucket_all.to_csv(bucket_path, index=False, encoding="utf-8-sig")
+    ic_all.to_csv(daily_ic_path, index=False, encoding="utf-8-sig")
+    yearly_bucket_all.to_csv(yearly_bucket_path, index=False, encoding="utf-8-sig")
+
+    result = {
+        "bucket_summary": bucket_path,
+        "daily_ic": daily_ic_path,
+        "yearly_bucket_summary": yearly_bucket_path,
+    }
+
+    if write_member_detail:
+        target_cols = [f"{mode_prefix}_fwd_return_pct_T{h}" for h in horizons]
+        rename_map = {
+            f"{mode_prefix}_fwd_return_pct_T{h}": f"fwd_return_pct_T{h}"
+            for h in horizons
+        }
+
+        member = shared[["symbol", "date", factor_col, bucket_col] + target_cols].rename(
+            columns=rename_map
+        )
+
+        member_path = step_file(output_dir, step, factor_name, f"{prefix}_member_detail", "parquet")
+        member.to_parquet(member_path, index=False)
+        result["member_detail"] = member_path
+
+    return result
+
+
 def run_single_factor_research(
     *,
     market_dir: Path,
@@ -586,20 +808,34 @@ def run_single_factor_research(
     )
     del factor_df
 
-    print("step 3/8: research return analysis")
-    research = run_analysis_and_rename(
+    print("step 3-4/8: shared research/trade analysis frame")
+    shared = build_shared_analysis_frame(
         market_dir=market_dir,
         factor_dir=factor_dir,
+        factor_col=factor_col,
+        research_horizons=research_horizons,
+        trade_horizons=trade_horizons,
+    )
+
+    shared[f"{factor_col}_bucket"] = assign_global_quantile_buckets(
+        shared,
+        factor_col=factor_col,
+        bucket_count=bucket_count,
+    )
+
+    print("step 3/8: research return analysis")
+    research = write_mode_outputs_from_shared_frame(
+        shared=shared,
         factor_col=factor_col,
         factor_name=factor_name,
         output_dir=output_dir,
         step=3,
         prefix="research",
+        mode_prefix="research",
         horizons=research_horizons,
-        bucket_count=bucket_count,
-        return_mode="t0_close_to_tn_close",
         write_member_detail=False,
     )
+
     diagnose_single_factor_result(
         bucket_summary_path=research["bucket_summary"],
         daily_ic_path=research["daily_ic"],
@@ -607,19 +843,19 @@ def run_single_factor_research(
     )
 
     print("step 4/8: trade return analysis")
-    trade = run_analysis_and_rename(
-        market_dir=market_dir,
-        factor_dir=factor_dir,
+    trade = write_mode_outputs_from_shared_frame(
+        shared=shared,
         factor_col=factor_col,
         factor_name=factor_name,
         output_dir=output_dir,
         step=4,
         prefix="trade",
+        mode_prefix="trade",
         horizons=trade_horizons,
-        bucket_count=bucket_count,
-        return_mode="t1_open_to_tn_close",
         write_member_detail=True,
     )
+
+    del shared
 
     print("step 5/8: bucket pattern")
     write_bucket_group_outputs(
