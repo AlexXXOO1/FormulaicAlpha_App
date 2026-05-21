@@ -1,0 +1,701 @@
+from __future__ import annotations
+
+import argparse
+import shutil
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from research.factor_analysis.analyze_single_factor import run_single_factor_analysis
+from research.factor_analysis.diagnose_single_factor_result import (
+    diagnose_single_factor_result,
+    infer_bucket_col,
+)
+
+
+GROUP_BINS = [0, 3, 7, 10]
+GROUP_LABELS = ["low_1_3", "middle_4_7", "high_8_10"]
+
+
+def parse_horizons(value: str) -> list[int]:
+    horizons = sorted({int(x.strip()) for x in value.split(",") if x.strip()})
+    if not horizons:
+        raise ValueError("At least one horizon is required.")
+    return horizons
+
+
+def step_file(output_dir: Path, step: int, factor_name: str, desc: str, suffix: str = "csv") -> Path:
+    return output_dir / f"step{step}_{factor_name}_{desc}.{suffix}"
+
+
+def move_output(src: Path, dst: Path) -> None:
+    if dst.exists():
+        dst.unlink()
+    if src.exists():
+        shutil.move(str(src), str(dst))
+
+
+def read_factor_dir(factor_dir: Path, factor_col: str) -> pd.DataFrame:
+    files = sorted(factor_dir.glob("*.parquet"))
+    if not files:
+        raise FileNotFoundError(f"No factor parquet files found: {factor_dir}")
+
+    parts = []
+    for i, p in enumerate(files, start=1):
+        if i % 500 == 0 or i == len(files):
+            print(f"loading factor {i}/{len(files)}")
+        parts.append(pd.read_parquet(p, columns=["symbol", "date", factor_col]))
+
+    df = pd.concat(parts, ignore_index=True)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+    df[factor_col] = pd.to_numeric(df[factor_col], errors="coerce")
+    return df
+
+
+def write_step1_input_validation(
+    *,
+    market_dir: Path,
+    factor_dir: Path,
+    factor_name: str,
+    output_dir: Path,
+) -> None:
+    market_files = sorted(market_dir.glob("*.parquet"))
+    factor_files = sorted(factor_dir.glob("*.parquet"))
+
+    market_symbols = {p.stem for p in market_files}
+    factor_symbols = {p.stem for p in factor_files}
+    all_symbols = sorted(market_symbols | factor_symbols)
+
+    alignment = pd.DataFrame({
+        "symbol": all_symbols,
+        "market_file_exists": [s in market_symbols for s in all_symbols],
+        "factor_file_exists": [s in factor_symbols for s in all_symbols],
+    })
+
+    validation = pd.DataFrame([
+        {"metric": "market_file_count", "value": len(market_files)},
+        {"metric": "factor_file_count", "value": len(factor_files)},
+        {"metric": "missing_factor_file_count", "value": len(market_symbols - factor_symbols)},
+        {"metric": "extra_factor_file_count", "value": len(factor_symbols - market_symbols)},
+        {"metric": "symbol_alignment_pass", "value": market_symbols == factor_symbols},
+    ])
+
+    validation.to_csv(
+        step_file(output_dir, 1, factor_name, "input_validation"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    alignment.to_csv(
+        step_file(output_dir, 1, factor_name, "symbol_alignment"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+
+def write_step2_factor_distribution(
+    *,
+    factor_df: pd.DataFrame,
+    factor_col: str,
+    factor_name: str,
+    output_dir: Path,
+) -> None:
+    s = factor_df[factor_col]
+
+    distribution = pd.DataFrame([{
+        "row_count": len(factor_df),
+        "non_null_count": int(s.notna().sum()),
+        "null_count": int(s.isna().sum()),
+        "unique_count": int(s.nunique(dropna=True)),
+        "min": float(s.min()) if s.notna().any() else np.nan,
+        "max": float(s.max()) if s.notna().any() else np.nan,
+        "mean": float(s.mean()) if s.notna().any() else np.nan,
+        "std": float(s.std()) if s.notna().any() else np.nan,
+        "p01": float(s.quantile(0.01)) if s.notna().any() else np.nan,
+        "p05": float(s.quantile(0.05)) if s.notna().any() else np.nan,
+        "p10": float(s.quantile(0.10)) if s.notna().any() else np.nan,
+        "p25": float(s.quantile(0.25)) if s.notna().any() else np.nan,
+        "p50": float(s.quantile(0.50)) if s.notna().any() else np.nan,
+        "p75": float(s.quantile(0.75)) if s.notna().any() else np.nan,
+        "p90": float(s.quantile(0.90)) if s.notna().any() else np.nan,
+        "p95": float(s.quantile(0.95)) if s.notna().any() else np.nan,
+        "p99": float(s.quantile(0.99)) if s.notna().any() else np.nan,
+    }])
+
+    daily = (
+        factor_df.groupby("date")
+        .agg(
+            row_count=("symbol", "size"),
+            non_null_count=(factor_col, lambda x: int(x.notna().sum())),
+        )
+        .reset_index()
+        .sort_values("date")
+    )
+    daily["coverage_ratio"] = daily["non_null_count"] / daily["row_count"]
+
+    distribution.to_csv(
+        step_file(output_dir, 2, factor_name, "factor_distribution"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    daily.to_csv(
+        step_file(output_dir, 2, factor_name, "daily_coverage"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+
+def run_analysis_and_rename(
+    *,
+    market_dir: Path,
+    factor_dir: Path,
+    factor_col: str,
+    factor_name: str,
+    output_dir: Path,
+    step: int,
+    prefix: str,
+    horizons: list[int],
+    bucket_count: int,
+    return_mode: str,
+    write_member_detail: bool,
+) -> dict[str, Path]:
+    run_single_factor_analysis(
+        market_path=market_dir,
+        factor_path=factor_dir,
+        factor_col=factor_col,
+        output_dir=output_dir,
+        horizons=horizons,
+        bucket_count=bucket_count,
+        return_mode=return_mode,
+        write_member_detail=write_member_detail,
+    )
+
+    bucket_path = step_file(output_dir, step, factor_name, f"{prefix}_bucket_summary")
+    daily_ic_path = step_file(output_dir, step, factor_name, f"{prefix}_daily_ic")
+    yearly_bucket_path = step_file(output_dir, step, factor_name, f"{prefix}_yearly_bucket_summary")
+
+    move_output(output_dir / "bucket_summary.csv", bucket_path)
+    move_output(output_dir / "daily_ic.csv", daily_ic_path)
+    move_output(output_dir / "yearly_bucket_summary.csv", yearly_bucket_path)
+
+    result = {
+        "bucket_summary": bucket_path,
+        "daily_ic": daily_ic_path,
+        "yearly_bucket_summary": yearly_bucket_path,
+    }
+
+    if write_member_detail:
+        member_path = step_file(output_dir, step, factor_name, f"{prefix}_member_detail", "parquet")
+        move_output(output_dir / "factor_member_detail.parquet", member_path)
+        result["member_detail"] = member_path
+
+    return result
+
+
+def write_bucket_group_outputs(
+    *,
+    bucket_summary_path: Path,
+    daily_ic_path: Path,
+    yearly_bucket_path: Path,
+    factor_name: str,
+    output_dir: Path,
+) -> None:
+    pattern_path = step_file(output_dir, 5, factor_name, "bucket_pattern_summary")
+    diagnose_single_factor_result(
+        bucket_summary_path=bucket_summary_path,
+        daily_ic_path=daily_ic_path,
+        output_path=pattern_path,
+    )
+
+    yearly = pd.read_csv(yearly_bucket_path)
+    bucket_col = infer_bucket_col(yearly)
+
+    yearly["bucket_group"] = pd.cut(
+        yearly[bucket_col],
+        bins=GROUP_BINS,
+        labels=GROUP_LABELS,
+    )
+
+    grouped = (
+        yearly.dropna(subset=["bucket_group"])
+        .groupby(["target", "year", "bucket_group"], observed=True)
+        .apply(
+            lambda x: pd.Series({
+                "sample_count": int(x["sample_count"].sum()),
+                "mean_return_pct": float((x["mean_return_pct"] * x["sample_count"]).sum() / x["sample_count"].sum()),
+                "up_ratio": float((x["up_ratio"] * x["sample_count"]).sum() / x["sample_count"].sum()),
+            }),
+            include_groups=False,
+        )
+        .reset_index()
+    )
+
+    grouped.to_csv(
+        step_file(output_dir, 5, factor_name, "bucket_group_summary"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    rows = []
+    for (target, year), part in grouped.groupby(["target", "year"], sort=True):
+        values = dict(zip(part["bucket_group"], part["mean_return_pct"]))
+        if not set(GROUP_LABELS).issubset(values):
+            continue
+
+        low = float(values["low_1_3"])
+        mid = float(values["middle_4_7"])
+        high = float(values["high_8_10"])
+
+        rows.append({
+            "target": target,
+            "year": int(year),
+            "middle_minus_low_pct": mid - low,
+            "middle_minus_high_pct": mid - high,
+            "middle_beats_low": mid > low,
+            "middle_beats_high": mid > high,
+            "middle_beats_both": mid > low and mid > high,
+            "best_group": max({"low_1_3": low, "middle_4_7": mid, "high_8_10": high}, key={"low_1_3": low, "middle_4_7": mid, "high_8_10": high}.get),
+        })
+
+    detail = pd.DataFrame(rows)
+    win = (
+        detail.groupby("target")
+        .agg(
+            year_count=("year", "count"),
+            middle_beats_low_count=("middle_beats_low", "sum"),
+            middle_beats_high_count=("middle_beats_high", "sum"),
+            middle_beats_both_count=("middle_beats_both", "sum"),
+            avg_middle_minus_low_pct=("middle_minus_low_pct", "mean"),
+            avg_middle_minus_high_pct=("middle_minus_high_pct", "mean"),
+        )
+        .reset_index()
+    )
+
+    win.to_csv(
+        step_file(output_dir, 5, factor_name, "bucket_group_win_summary"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+
+def make_train_edges(member: pd.DataFrame, factor_col: str, bucket_count: int, train_start: int, train_end: int) -> np.ndarray:
+    train = member[
+        member["year"].between(train_start, train_end)
+        & member[factor_col].notna()
+    ].copy()
+
+    if train.empty:
+        raise ValueError("No train rows available for bucket edge calculation.")
+
+    quantiles = [i / bucket_count for i in range(bucket_count + 1)]
+    raw_edges = train[factor_col].quantile(quantiles).to_numpy(copy=True)
+
+    edges = raw_edges.copy()
+    edges[0] = -float("inf")
+    edges[-1] = float("inf")
+
+    return raw_edges, edges
+
+
+def assign_train_bucket(series: pd.Series, edges: np.ndarray, bucket_count: int) -> pd.Series:
+    return pd.cut(
+        series,
+        bins=edges,
+        labels=list(range(1, bucket_count + 1)),
+        include_lowest=True,
+        duplicates="drop",
+    ).astype("float64")
+
+
+def write_step6_train_test(
+    *,
+    member_path: Path,
+    factor_col: str,
+    factor_name: str,
+    output_dir: Path,
+    bucket_count: int,
+    train_start: int,
+    train_end: int,
+    test_start: int,
+    test_end: int,
+    targets: list[str],
+) -> tuple[pd.DataFrame, np.ndarray]:
+    member = pd.read_parquet(member_path)
+    member["date"] = pd.to_datetime(member["date"]).dt.normalize()
+    member["year"] = member["date"].dt.year
+
+    raw_edges, edges = make_train_edges(member, factor_col, bucket_count, train_start, train_end)
+
+    edge_table = pd.DataFrame({
+        "bucket": list(range(1, bucket_count + 1)),
+        "lower_edge": raw_edges[:-1],
+        "upper_edge": raw_edges[1:],
+    })
+    edge_table.to_csv(
+        step_file(output_dir, 6, factor_name, "train_bucket_edges"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    member["train_defined_bucket"] = assign_train_bucket(member[factor_col], edges, bucket_count)
+    member["bucket_group"] = pd.cut(
+        member["train_defined_bucket"],
+        bins=GROUP_BINS,
+        labels=GROUP_LABELS,
+    )
+
+    rows = []
+    datasets = [
+        ("train", member[member["year"].between(train_start, train_end)]),
+        ("test", member[member["year"].between(test_start, test_end)]),
+    ]
+
+    for dataset_name, part in datasets:
+        for target in targets:
+            work = part.dropna(subset=["bucket_group", target])
+            if work.empty:
+                continue
+
+            summary = (
+                work.groupby("bucket_group", observed=True)
+                .agg(
+                    sample_count=(target, "size"),
+                    mean_return_pct=(target, "mean"),
+                    median_return_pct=(target, "median"),
+                    up_ratio=(target, lambda x: float((x > 0).mean())),
+                )
+                .reset_index()
+            )
+            summary.insert(0, "target", target)
+            summary.insert(0, "dataset", dataset_name)
+            rows.append(summary)
+
+    out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    out.to_csv(
+        step_file(output_dir, 6, factor_name, "train_test_bucket_check"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    return member, edges
+
+
+def write_step7_candidate_counts(
+    *,
+    member: pd.DataFrame,
+    factor_name: str,
+    output_dir: Path,
+) -> None:
+    bucket_col = f"{factor_name}_bucket"
+    if bucket_col not in member.columns:
+        raise ValueError(f"Missing expected bucket column: {bucket_col}")
+
+    work = member.dropna(subset=[bucket_col]).copy()
+    work["all_sample_bucket_group"] = pd.cut(
+        work[bucket_col],
+        bins=GROUP_BINS,
+        labels=GROUP_LABELS,
+    )
+
+    daily = (
+        work.groupby("date")
+        .agg(
+            universe_count=("symbol", "size"),
+            middle_4_7_count=("all_sample_bucket_group", lambda x: int((x == "middle_4_7").sum())),
+            low_1_3_count=("all_sample_bucket_group", lambda x: int((x == "low_1_3").sum())),
+            high_8_10_count=("all_sample_bucket_group", lambda x: int((x == "high_8_10").sum())),
+        )
+        .reset_index()
+    )
+    daily["middle_4_7_ratio"] = daily["middle_4_7_count"] / daily["universe_count"]
+
+    daily.to_csv(
+        step_file(output_dir, 7, factor_name, "daily_candidate_count"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    train_daily = (
+        member.dropna(subset=["bucket_group"])
+        .groupby("date")
+        .agg(
+            universe_count=("symbol", "size"),
+            middle_4_7_count=("bucket_group", lambda x: int((x == "middle_4_7").sum())),
+            low_1_3_count=("bucket_group", lambda x: int((x == "low_1_3").sum())),
+            high_8_10_count=("bucket_group", lambda x: int((x == "high_8_10").sum())),
+        )
+        .reset_index()
+    )
+    train_daily["middle_4_7_ratio"] = train_daily["middle_4_7_count"] / train_daily["universe_count"]
+
+    train_daily.to_csv(
+        step_file(output_dir, 7, factor_name, "train_defined_daily_candidate_count"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+
+def write_step8_custom_regime(
+    *,
+    member: pd.DataFrame,
+    custom_market_regime: Path,
+    factor_name: str,
+    output_dir: Path,
+    targets: list[str],
+) -> None:
+    regime = pd.read_csv(custom_market_regime)
+    regime["date"] = pd.to_datetime(regime["date"]).dt.normalize()
+
+    keep_cols = [
+        c for c in ["date", "market_regime", "risk_score", "trend_score", "repair_score"]
+        if c in regime.columns
+    ]
+    regime = regime[keep_cols].drop_duplicates("date", keep="last")
+
+    rows = []
+
+    for target in targets:
+        valid = member.dropna(subset=[target, "bucket_group"]).copy()
+
+        universe_daily = (
+            valid.groupby("date")
+            .agg(
+                universe_count=("symbol", "size"),
+                universe_return_pct=(target, "mean"),
+            )
+            .reset_index()
+        )
+
+        group_daily = (
+            valid.groupby(["date", "bucket_group"], observed=True)
+            .agg(
+                group_count=("symbol", "size"),
+                group_return_pct=(target, "mean"),
+            )
+            .reset_index()
+            .rename(columns={"bucket_group": "alpha001_group"})
+        )
+
+        merged = group_daily.merge(universe_daily, on="date", how="left")
+        merged = merged.merge(regime, on="date", how="inner")
+        merged["target"] = target
+        merged["year"] = merged["date"].dt.year
+        merged["excess_return_pct"] = merged["group_return_pct"] - merged["universe_return_pct"]
+
+        rows.append(merged)
+
+    detail = pd.concat(rows, ignore_index=True)
+
+    summary = (
+        detail.groupby(["target", "market_regime", "alpha001_group"], observed=True)
+        .agg(
+            trading_days=("date", "nunique"),
+            avg_group_count=("group_count", "mean"),
+            avg_universe_count=("universe_count", "mean"),
+            mean_group_return_pct=("group_return_pct", "mean"),
+            mean_universe_return_pct=("universe_return_pct", "mean"),
+            mean_excess_return_pct=("excess_return_pct", "mean"),
+            median_excess_return_pct=("excess_return_pct", "median"),
+            excess_win_ratio=("excess_return_pct", lambda x: float((x > 0).mean())),
+        )
+        .reset_index()
+    )
+
+    middle_yearly = (
+        detail[detail["alpha001_group"].eq("middle_4_7")]
+        .groupby(["target", "market_regime", "year"], observed=True)
+        .agg(
+            trading_days=("date", "nunique"),
+            avg_group_count=("group_count", "mean"),
+            mean_group_return_pct=("group_return_pct", "mean"),
+            mean_universe_return_pct=("universe_return_pct", "mean"),
+            mean_excess_return_pct=("excess_return_pct", "mean"),
+            median_excess_return_pct=("excess_return_pct", "median"),
+            excess_win_ratio=("excess_return_pct", lambda x: float((x > 0).mean())),
+        )
+        .reset_index()
+    )
+
+    stability = (
+        middle_yearly.groupby(["target", "market_regime"], observed=True)
+        .agg(
+            year_count=("year", "count"),
+            positive_excess_years=("mean_excess_return_pct", lambda x: int((x > 0).sum())),
+            avg_excess_pct=("mean_excess_return_pct", "mean"),
+            median_excess_pct=("mean_excess_return_pct", "median"),
+            avg_win_ratio=("excess_win_ratio", "mean"),
+            min_excess_pct=("mean_excess_return_pct", "min"),
+            max_excess_pct=("mean_excess_return_pct", "max"),
+        )
+        .reset_index()
+    )
+
+    summary.to_csv(
+        step_file(output_dir, 8, factor_name, "custom_regime_group_summary"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    stability.to_csv(
+        step_file(output_dir, 8, factor_name, "custom_regime_yearly_stability"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    middle_yearly.to_csv(
+        step_file(output_dir, 8, factor_name, "custom_regime_middle_yearly"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+
+def run_single_factor_research(
+    *,
+    market_dir: Path,
+    factor_dir: Path,
+    factor_col: str,
+    output_dir: Path,
+    custom_market_regime: Path,
+    bucket_count: int = 10,
+    research_horizons: list[int] | None = None,
+    trade_horizons: list[int] | None = None,
+    train_start: int = 2021,
+    train_end: int = 2024,
+    test_start: int = 2025,
+    test_end: int = 2026,
+) -> None:
+    factor_name = factor_col
+    research_horizons = research_horizons or [1, 2, 3, 4, 5, 6, 7]
+    trade_horizons = trade_horizons or [2, 3, 4]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("step 1/8: input validation")
+    write_step1_input_validation(
+        market_dir=market_dir,
+        factor_dir=factor_dir,
+        factor_name=factor_name,
+        output_dir=output_dir,
+    )
+
+    print("step 2/8: factor distribution")
+    factor_df = read_factor_dir(factor_dir, factor_col)
+    write_step2_factor_distribution(
+        factor_df=factor_df,
+        factor_col=factor_col,
+        factor_name=factor_name,
+        output_dir=output_dir,
+    )
+    del factor_df
+
+    print("step 3/8: research return analysis")
+    research = run_analysis_and_rename(
+        market_dir=market_dir,
+        factor_dir=factor_dir,
+        factor_col=factor_col,
+        factor_name=factor_name,
+        output_dir=output_dir,
+        step=3,
+        prefix="research",
+        horizons=research_horizons,
+        bucket_count=bucket_count,
+        return_mode="t0_close_to_tn_close",
+        write_member_detail=False,
+    )
+    diagnose_single_factor_result(
+        bucket_summary_path=research["bucket_summary"],
+        daily_ic_path=research["daily_ic"],
+        output_path=step_file(output_dir, 3, factor_name, "research_factor_diagnosis"),
+    )
+
+    print("step 4/8: trade return analysis")
+    trade = run_analysis_and_rename(
+        market_dir=market_dir,
+        factor_dir=factor_dir,
+        factor_col=factor_col,
+        factor_name=factor_name,
+        output_dir=output_dir,
+        step=4,
+        prefix="trade",
+        horizons=trade_horizons,
+        bucket_count=bucket_count,
+        return_mode="t1_open_to_tn_close",
+        write_member_detail=True,
+    )
+
+    print("step 5/8: bucket pattern")
+    write_bucket_group_outputs(
+        bucket_summary_path=trade["bucket_summary"],
+        daily_ic_path=trade["daily_ic"],
+        yearly_bucket_path=trade["yearly_bucket_summary"],
+        factor_name=factor_name,
+        output_dir=output_dir,
+    )
+
+    print("step 6/8: train/test bucket check")
+    trade_targets = [f"fwd_return_pct_T{x}" for x in trade_horizons]
+    member, _ = write_step6_train_test(
+        member_path=trade["member_detail"],
+        factor_col=factor_col,
+        factor_name=factor_name,
+        output_dir=output_dir,
+        bucket_count=bucket_count,
+        train_start=train_start,
+        train_end=train_end,
+        test_start=test_start,
+        test_end=test_end,
+        targets=trade_targets,
+    )
+
+    print("step 7/8: candidate count")
+    write_step7_candidate_counts(
+        member=member,
+        factor_name=factor_name,
+        output_dir=output_dir,
+    )
+
+    print("step 8/8: custom market regime")
+    write_step8_custom_regime(
+        member=member,
+        custom_market_regime=custom_market_regime,
+        factor_name=factor_name,
+        output_dir=output_dir,
+        targets=trade_targets,
+    )
+
+    print("single factor research: DONE")
+    print("output_dir:", output_dir)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--market-dir", required=True)
+    parser.add_argument("--factor-dir", required=True)
+    parser.add_argument("--factor-col", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--custom-market-regime", required=True)
+    parser.add_argument("--bucket-count", type=int, default=10)
+    parser.add_argument("--research-horizons", default="1,2,3,4,5,6,7")
+    parser.add_argument("--trade-horizons", default="2,3,4")
+    parser.add_argument("--train-start", type=int, default=2021)
+    parser.add_argument("--train-end", type=int, default=2024)
+    parser.add_argument("--test-start", type=int, default=2025)
+    parser.add_argument("--test-end", type=int, default=2026)
+    args = parser.parse_args()
+
+    run_single_factor_research(
+        market_dir=Path(args.market_dir),
+        factor_dir=Path(args.factor_dir),
+        factor_col=args.factor_col,
+        output_dir=Path(args.output_dir),
+        custom_market_regime=Path(args.custom_market_regime),
+        bucket_count=args.bucket_count,
+        research_horizons=parse_horizons(args.research_horizons),
+        trade_horizons=parse_horizons(args.trade_horizons),
+        train_start=args.train_start,
+        train_end=args.train_end,
+        test_start=args.test_start,
+        test_end=args.test_end,
+    )
+
+
+if __name__ == "__main__":
+    main()

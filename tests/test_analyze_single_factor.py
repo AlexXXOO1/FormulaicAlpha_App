@@ -61,9 +61,11 @@ def test_run_single_factor_analysis_with_market_and_factor_dirs(tmp_path: Path):
     assert result["merged_rows"] == 90
     assert result["factor_non_null"] == 90
     assert result["bucket_summary_rows"] > 0
+    assert result["yearly_bucket_summary_rows"] > 0
     assert result["daily_ic_rows"] > 0
 
     bucket = pd.read_csv(output_dir / "bucket_summary.csv")
+    yearly_bucket = pd.read_csv(output_dir / "yearly_bucket_summary.csv")
     daily_ic = pd.read_csv(output_dir / "daily_ic.csv")
     detail = pd.read_parquet(output_dir / "factor_member_detail.parquet")
 
@@ -72,5 +74,6 @@ def test_run_single_factor_analysis_with_market_and_factor_dirs(tmp_path: Path):
         "fwd_return_pct_T2",
         "fwd_return_pct_T5",
     }
+    assert "year" in yearly_bucket.columns
     assert "spearman_ic" in daily_ic.columns
     assert "alpha_001_bucket" in detail.columns
