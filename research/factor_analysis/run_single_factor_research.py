@@ -854,6 +854,247 @@ def write_step9_train_defined_bucket_regime_check(
 
 
 
+
+
+def bucket_rule_from_group(bucket_group: str) -> str:
+    mapping = {
+        "low_1_3": "train_defined_bucket in [1,2,3]",
+        "middle_4_7": "train_defined_bucket in [4,5,6,7]",
+        "high_8_10": "train_defined_bucket in [8,9,10]",
+        "bucket_4": "train_defined_bucket in [4]",
+        "bucket_4_5": "train_defined_bucket in [4,5]",
+    }
+    return mapping.get(bucket_group, f"bucket_group = {bucket_group}")
+
+
+def write_step10_factor_conclusion(
+    *,
+    factor_name: str,
+    output_dir: Path,
+) -> None:
+    step9_path = step_file(output_dir, 9, factor_name, "train_defined_bucket_regime_check")
+
+    if not step9_path.exists():
+        raise FileNotFoundError(f"Missing Step9 file: {step9_path}")
+
+    df = pd.read_csv(step9_path)
+
+    required_cols = [
+        "target",
+        "bucket_group",
+        "market_regime",
+        "trading_days",
+        "avg_group_count",
+        "mean_excess_return_pct",
+        "median_excess_return_pct",
+        "excess_win_ratio",
+    ]
+
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Step9 file missing required columns: {missing}")
+
+    available_targets = sorted(df["target"].dropna().unique().tolist())
+    focus_targets = [x for x in ["fwd_return_pct_T3", "fwd_return_pct_T4"] if x in available_targets]
+
+    if not focus_targets:
+        focus_targets = available_targets
+
+    focus_all = df[df["target"].isin(focus_targets)].copy()
+
+    group_score = (
+        focus_all.groupby("bucket_group", observed=True)
+        .agg(
+            row_count=("mean_excess_return_pct", "size"),
+            positive_row_count=("mean_excess_return_pct", lambda x: int((x > 0).sum())),
+            avg_excess_pct=("mean_excess_return_pct", "mean"),
+            median_excess_pct=("mean_excess_return_pct", "median"),
+            avg_win_ratio=("excess_win_ratio", "mean"),
+            min_excess_pct=("mean_excess_return_pct", "min"),
+            max_excess_pct=("mean_excess_return_pct", "max"),
+            avg_group_count=("avg_group_count", "mean"),
+        )
+        .reset_index()
+    )
+
+    group_score["positive_row_ratio"] = group_score["positive_row_count"] / group_score["row_count"]
+
+    group_score = group_score.sort_values(
+        ["positive_row_ratio", "avg_excess_pct", "avg_win_ratio"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+    if group_score.empty:
+        raise ValueError("No bucket group score available for Step10.")
+
+    best_bucket_group = str(group_score.loc[0, "bucket_group"])
+    best_group_score = group_score.loc[0].to_dict()
+
+    focus = focus_all[focus_all["bucket_group"].eq(best_bucket_group)].copy()
+
+    regime_check = (
+        focus.groupby("market_regime", observed=True)
+        .agg(
+            target_count=("target", "nunique"),
+            positive_target_count=("mean_excess_return_pct", lambda x: int((x > 0).sum())),
+            avg_excess_pct=("mean_excess_return_pct", "mean"),
+            avg_win_ratio=("excess_win_ratio", "mean"),
+            min_excess_pct=("mean_excess_return_pct", "min"),
+            max_excess_pct=("mean_excess_return_pct", "max"),
+            avg_group_count=("avg_group_count", "mean"),
+        )
+        .reset_index()
+    )
+
+    valid_regimes = regime_check[
+        (regime_check["target_count"] > 0)
+        & (regime_check["positive_target_count"] == regime_check["target_count"])
+    ]["market_regime"].tolist()
+
+    avoid_regimes = regime_check[
+        regime_check["positive_target_count"] < regime_check["target_count"]
+    ]["market_regime"].tolist()
+
+    target_score = (
+        focus.groupby("target", observed=True)
+        .agg(
+            avg_excess_pct=("mean_excess_return_pct", "mean"),
+            avg_win_ratio=("excess_win_ratio", "mean"),
+        )
+        .reset_index()
+        .sort_values(["avg_excess_pct", "avg_win_ratio"], ascending=[False, False])
+    )
+
+    main_target = str(target_score.iloc[0]["target"]) if not target_score.empty else ""
+    secondary_target = str(target_score.iloc[1]["target"]) if len(target_score) > 1 else ""
+
+    main_horizon = main_target.replace("fwd_return_pct_", "") if main_target else ""
+    secondary_horizon = secondary_target.replace("fwd_return_pct_", "") if secondary_target else ""
+
+    avg_excess = float(best_group_score.get("avg_excess_pct", 0.0))
+    avg_win_ratio = float(best_group_score.get("avg_win_ratio", 0.0))
+    avg_group_count = float(best_group_score.get("avg_group_count", 0.0))
+
+    if not valid_regimes or avg_excess <= 0:
+        factor_type = "reject_factor"
+        standalone_tradable = False
+        is_filter_factor = False
+        is_scoring_factor = False
+        recommended_usage = "Reject for now. Do not use this factor in strategy construction."
+        rejection_reason = "No stable positive excess return after train-defined bucket and regime validation."
+        next_action = "Move to the next factor or revisit after more data/features are available."
+    elif avoid_regimes:
+        factor_type = "regime_aware_filter"
+        standalone_tradable = False
+        is_filter_factor = True
+        is_scoring_factor = False
+        recommended_usage = "Use this factor only under valid regimes as a broad filter before combining with stronger precision factors."
+        rejection_reason = "The factor effect is regime-dependent and not sufficient as a standalone stock-selection signal."
+        next_action = "Keep this factor as a regime-aware filter and combine with additional factors."
+    elif avg_group_count > 500:
+        factor_type = "broad_filter"
+        standalone_tradable = False
+        is_filter_factor = True
+        is_scoring_factor = False
+        recommended_usage = "Use this factor as a broad universe filter before combining with stronger precision factors."
+        rejection_reason = "Candidate pool remains too wide for standalone stock selection."
+        next_action = "Combine with additional factors to improve precision."
+    elif avg_win_ratio >= 0.55:
+        factor_type = "candidate_scoring_factor"
+        standalone_tradable = False
+        is_filter_factor = True
+        is_scoring_factor = True
+        recommended_usage = "Use this factor as one component in a multi-factor scoring model."
+        rejection_reason = "Single-factor validation is not enough to approve standalone trading."
+        next_action = "Test this factor inside a multi-factor combination."
+    else:
+        factor_type = "weak_filter"
+        standalone_tradable = False
+        is_filter_factor = True
+        is_scoring_factor = False
+        recommended_usage = "Use cautiously as a weak filter only if it improves a multi-factor combination."
+        rejection_reason = "Positive excess exists but the win ratio is not strong enough for standalone use."
+        next_action = "Validate contribution in multi-factor tests."
+
+    conclusion = {
+        "factor_name": factor_name,
+        "factor_source": "101 Formulaic Alphas",
+        "factor_type": factor_type,
+        "formula_summary": f"See alpha_engine/formulaic_alphas/{factor_name}.py",
+        "return_mode": "T0 signal, T+1 open buy, T+2/T+3/T+4 close evaluation",
+        "bucket_method": "train-defined global quantile buckets",
+        "best_bucket_group": best_bucket_group,
+        "bucket_rule": bucket_rule_from_group(best_bucket_group),
+        "valid_regime": ",".join(valid_regimes),
+        "avoid_regime": ",".join(avoid_regimes),
+        "main_horizon": main_horizon,
+        "secondary_horizon": secondary_horizon,
+        "standalone_tradable": standalone_tradable,
+        "is_filter_factor": is_filter_factor,
+        "is_scoring_factor": is_scoring_factor,
+        "avg_excess_pct": avg_excess,
+        "avg_win_ratio": avg_win_ratio,
+        "avg_group_count": avg_group_count,
+        "recommended_usage": recommended_usage,
+        "rejection_reason_as_standalone": rejection_reason,
+        "next_action": next_action,
+    }
+
+    out_csv = step_file(output_dir, 10, factor_name, "factor_conclusion")
+    out_md = step_file(output_dir, 10, factor_name, "factor_conclusion", suffix="md")
+
+    pd.DataFrame([conclusion]).to_csv(out_csv, index=False, encoding="utf-8-sig")
+
+    md = f"""# {factor_name} Factor Conclusion
+
+## Final Classification
+
+| Field | Value |
+|---|---|
+| factor_name | {factor_name} |
+| factor_source | 101 Formulaic Alphas |
+| factor_type | {factor_type} |
+| return_mode | {conclusion["return_mode"]} |
+| bucket_method | {conclusion["bucket_method"]} |
+| best_bucket_group | {best_bucket_group} |
+| bucket_rule | {conclusion["bucket_rule"]} |
+| valid_regime | {conclusion["valid_regime"]} |
+| avoid_regime | {conclusion["avoid_regime"]} |
+| main_horizon | {main_horizon} |
+| secondary_horizon | {secondary_horizon} |
+| standalone_tradable | {standalone_tradable} |
+| is_filter_factor | {is_filter_factor} |
+| is_scoring_factor | {is_scoring_factor} |
+
+## Recommended Usage
+
+{recommended_usage}
+
+## Rejection Reason As Standalone
+
+{rejection_reason}
+
+## Next Action
+
+{next_action}
+
+## Bucket Group Score
+
+{group_score.to_string(index=False)}
+
+## Core Evidence: Selected Bucket Group
+
+{focus.to_string(index=False)}
+
+## Regime Summary
+
+{regime_check.to_string(index=False)}
+"""
+
+    out_md.write_text(md, encoding="utf-8")
+
+
+
 def run_single_factor_research(
     *,
     market_dir: Path,
@@ -973,7 +1214,7 @@ def run_single_factor_research(
         output_dir=output_dir,
     )
 
-    print("step 8/9: custom market regime")
+    print("step 8/10: custom market regime")
     write_step8_custom_regime(
         member=member,
         custom_market_regime=custom_market_regime,
@@ -982,13 +1223,19 @@ def run_single_factor_research(
         targets=trade_targets,
     )
 
-    print("step 9/9: train-defined bucket regime check")
+    print("step 9/10: train-defined bucket regime check")
     write_step9_train_defined_bucket_regime_check(
         member=member,
         custom_market_regime=custom_market_regime,
         factor_name=factor_name,
         output_dir=output_dir,
         targets=trade_targets,
+    )
+
+    print("step 10/10: factor conclusion")
+    write_step10_factor_conclusion(
+        factor_name=factor_name,
+        output_dir=output_dir,
     )
 
     print("single factor research: DONE")
