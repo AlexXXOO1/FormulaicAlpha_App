@@ -101,3 +101,21 @@ def test_run_single_factor_research_writes_step_outputs(tmp_path: Path):
 
     for name in expected:
         assert (output_dir / name).exists(), name
+
+
+
+def test_assign_train_bucket_handles_duplicate_edges():
+    import numpy as np
+    import pandas as pd
+
+    from research.factor_analysis.run_single_factor_research import assign_train_bucket
+
+    series = pd.Series([-1.0, -0.9, -0.8, -0.7, -0.6])
+    edges = np.array([-np.inf, -1.0, -1.0, -0.9, -0.8, -0.7, -0.6, np.inf])
+
+    out = assign_train_bucket(series, edges, bucket_count=7)
+
+    assert len(out) == len(series)
+    assert out.notna().all()
+    assert out.min() >= 1
+    assert out.max() <= 6

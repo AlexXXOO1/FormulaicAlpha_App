@@ -316,12 +316,30 @@ def make_train_edges(member: pd.DataFrame, factor_col: str, bucket_count: int, t
 
 
 def assign_train_bucket(series: pd.Series, edges: np.ndarray, bucket_count: int) -> pd.Series:
+    values = pd.to_numeric(series, errors="coerce")
+
+    bins = (
+        pd.Series(edges, dtype="float64")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+        .tolist()
+    )
+
+    if len(bins) < 2:
+        return pd.Series(np.nan, index=series.index, dtype="float64")
+
+    bins[0] = -float("inf")
+    bins[-1] = float("inf")
+
+    labels = list(range(1, len(bins)))
+
     return pd.cut(
-        series,
-        bins=edges,
-        labels=list(range(1, bucket_count + 1)),
+        values,
+        bins=bins,
+        labels=labels,
         include_lowest=True,
-        duplicates="drop",
     ).astype("float64")
 
 
