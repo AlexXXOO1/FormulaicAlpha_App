@@ -94,6 +94,7 @@ def test_run_single_factor_research_writes_step_outputs(tmp_path: Path):
         "step8_alpha_001_custom_regime_group_summary.csv",
         "step8_alpha_001_custom_regime_yearly_stability.csv",
         "step8_alpha_001_custom_regime_middle_yearly.csv",
+        "step9_alpha_001_train_defined_bucket_regime_check.csv",
     ]
 
     for name in expected:

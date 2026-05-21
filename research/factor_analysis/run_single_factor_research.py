@@ -769,6 +769,91 @@ def write_mode_outputs_from_shared_frame(
     return result
 
 
+
+def write_step9_train_defined_bucket_regime_check(
+    *,
+    member: pd.DataFrame,
+    custom_market_regime: Path,
+    factor_name: str,
+    output_dir: Path,
+    targets: list[str],
+) -> None:
+    if "train_defined_bucket" not in member.columns:
+        raise ValueError("Step9 requires train_defined_bucket. Run Step6 before Step9.")
+
+    regime = pd.read_csv(custom_market_regime)
+    regime["date"] = pd.to_datetime(regime["date"], errors="coerce").dt.normalize()
+
+    if "market_regime" not in regime.columns:
+        raise ValueError("custom_market_regime must contain market_regime column.")
+
+    regime = regime[["date", "market_regime"]].dropna(subset=["date", "market_regime"])
+    regime = regime.drop_duplicates(subset=["date"], keep="last")
+
+    df = member.merge(regime, on="date", how="left")
+
+    bucket_groups = {
+        "bucket_4": [4.0],
+        "bucket_4_5": [4.0, 5.0],
+        "middle_4_7": [4.0, 5.0, 6.0, 7.0],
+    }
+
+    rows = []
+
+    for target in targets:
+        valid = df.dropna(subset=[target, "train_defined_bucket", "market_regime"]).copy()
+
+        universe_daily = (
+            valid.groupby("date", as_index=False)
+            .agg(universe_return_pct=(target, "mean"))
+        )
+
+        for bucket_group, buckets in bucket_groups.items():
+            group_df = valid[valid["train_defined_bucket"].isin(buckets)].copy()
+
+            if group_df.empty:
+                continue
+
+            daily = (
+                group_df.groupby(["date", "market_regime"], as_index=False)
+                .agg(
+                    group_count=("symbol", "size"),
+                    group_return_pct=(target, "mean"),
+                )
+                .merge(universe_daily, on="date", how="left")
+            )
+
+            daily["excess_return_pct"] = daily["group_return_pct"] - daily["universe_return_pct"]
+
+            summary = (
+                daily.groupby("market_regime", as_index=False)
+                .agg(
+                    trading_days=("date", "nunique"),
+                    avg_group_count=("group_count", "mean"),
+                    mean_group_return_pct=("group_return_pct", "mean"),
+                    mean_universe_return_pct=("universe_return_pct", "mean"),
+                    mean_excess_return_pct=("excess_return_pct", "mean"),
+                    median_excess_return_pct=("excess_return_pct", "median"),
+                    excess_win_ratio=("excess_return_pct", lambda x: float((x > 0).mean())),
+                )
+            )
+
+            summary.insert(0, "bucket_group", bucket_group)
+            summary.insert(0, "target", target)
+
+            rows.append(summary)
+
+    out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+    out.to_csv(
+        step_file(output_dir, 9, factor_name, "train_defined_bucket_regime_check"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+
+
+
 def run_single_factor_research(
     *,
     market_dir: Path,
@@ -888,8 +973,17 @@ def run_single_factor_research(
         output_dir=output_dir,
     )
 
-    print("step 8/8: custom market regime")
+    print("step 8/9: custom market regime")
     write_step8_custom_regime(
+        member=member,
+        custom_market_regime=custom_market_regime,
+        factor_name=factor_name,
+        output_dir=output_dir,
+        targets=trade_targets,
+    )
+
+    print("step 9/9: train-defined bucket regime check")
+    write_step9_train_defined_bucket_regime_check(
         member=member,
         custom_market_regime=custom_market_regime,
         factor_name=factor_name,
