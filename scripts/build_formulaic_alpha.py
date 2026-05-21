@@ -14,18 +14,12 @@ def main() -> None:
     parser.add_argument("--output-dir", default=str(FORMULAIC_ALPHAS_BY_SYMBOL))
     args = parser.parse_args()
 
-    print("alpha:", args.alpha)
-    print("input_dir:", args.input_dir)
-    print("output_dir:", args.output_dir)
-
-    report = build_formulaic_alpha(
+    build_formulaic_alpha(
         alpha_name=args.alpha,
         input_dir=Path(args.input_dir),
         output_dir=Path(args.output_dir),
+        show_progress=True,
     )
-
-    print(report.to_string(index=False))
-    print(f"build {args.alpha}: DONE")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 import pandas as pd
 
@@ -45,7 +46,36 @@ REQUIRED_MARKET_COLUMNS = [
 ]
 
 
-def load_market_parquet_dir(input_dir: Path = DAILY_BARS_BY_SYMBOL) -> pd.DataFrame:
+def _print_progress(
+    *,
+    label: str,
+    current: int,
+    total: int,
+    enabled: bool,
+) -> None:
+    if not enabled or total <= 0:
+        return
+
+    current = min(max(current, 0), total)
+    width = 30
+    pct = current / total
+    filled = int(width * pct)
+    bar = "#" * filled + "-" * (width - filled)
+
+    end = "\n" if current >= total else ""
+    sys.stderr.write(f"\r{label} [{bar}] {current}/{total} {pct:6.2%}")
+    sys.stderr.flush()
+
+    if end:
+        sys.stderr.write(end)
+        sys.stderr.flush()
+
+
+def load_market_parquet_dir(
+    input_dir: Path = DAILY_BARS_BY_SYMBOL,
+    *,
+    show_progress: bool = False,
+) -> pd.DataFrame:
     files = sorted(Path(input_dir).glob("*.parquet"))
 
     if not files:
@@ -53,7 +83,9 @@ def load_market_parquet_dir(input_dir: Path = DAILY_BARS_BY_SYMBOL) -> pd.DataFr
 
     parts = []
 
-    for file in files:
+    total_files = len(files)
+
+    for idx, file in enumerate(files, start=1):
         df = pd.read_parquet(file)
 
         missing = [c for c in REQUIRED_MARKET_COLUMNS if c not in df.columns]
@@ -61,6 +93,12 @@ def load_market_parquet_dir(input_dir: Path = DAILY_BARS_BY_SYMBOL) -> pd.DataFr
             raise ValueError(f"{file} missing required market columns: {missing}")
 
         parts.append(df[REQUIRED_MARKET_COLUMNS].copy())
+        _print_progress(
+            label="read market",
+            current=idx,
+            total=total_files,
+            enabled=show_progress,
+        )
 
     out = pd.concat(parts, ignore_index=True)
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
@@ -90,8 +128,12 @@ def build_alpha_input_frame(market_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def load_alpha_input_frame(input_dir: Path = DAILY_BARS_BY_SYMBOL) -> pd.DataFrame:
-    market_df = load_market_parquet_dir(input_dir)
+def load_alpha_input_frame(
+    input_dir: Path = DAILY_BARS_BY_SYMBOL,
+    *,
+    show_progress: bool = False,
+) -> pd.DataFrame:
+    market_df = load_market_parquet_dir(input_dir, show_progress=show_progress)
     return build_alpha_input_frame(market_df)
 
 
@@ -147,12 +189,17 @@ def save_alpha_by_symbol(
     alpha_df: pd.DataFrame,
     output_dir: Path,
     alpha_col: str,
+    *,
+    show_progress: bool = False,
 ) -> pd.DataFrame:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     report_rows = []
 
-    for _, part in alpha_df.groupby("symbol", sort=True):
+    grouped = alpha_df.groupby("symbol", sort=True)
+    total_symbols = grouped.ngroups
+
+    for idx, (_, part) in enumerate(grouped, start=1):
         symbol = str(part["symbol"].iloc[0])
         output_path = output_dir / f"{symbol}.parquet"
 
@@ -163,6 +210,12 @@ def save_alpha_by_symbol(
         )
 
         report_rows.append(report)
+        _print_progress(
+            label=f"write {alpha_col}",
+            current=idx,
+            total=total_symbols,
+            enabled=show_progress,
+        )
 
     return pd.DataFrame(report_rows)
 
@@ -172,13 +225,14 @@ def build_formulaic_alpha(
     alpha_name: str,
     input_dir: Path = DAILY_BARS_BY_SYMBOL,
     output_dir: Path = FORMULAIC_ALPHAS_BY_SYMBOL,
+    show_progress: bool = False,
 ) -> pd.DataFrame:
     ensure_data_dirs()
 
     alpha_name = alpha_name.strip().lower()
     compute_alpha = get_formulaic_alpha(alpha_name)
 
-    alpha_input = load_alpha_input_frame(Path(input_dir))
+    alpha_input = load_alpha_input_frame(Path(input_dir), show_progress=show_progress)
     alpha_df = compute_alpha(alpha_input)
 
     if alpha_name not in alpha_df.columns:
@@ -188,4 +242,5 @@ def build_formulaic_alpha(
         alpha_df=alpha_df,
         output_dir=Path(output_dir),
         alpha_col=alpha_name,
+        show_progress=show_progress,
     )
