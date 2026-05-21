@@ -3,11 +3,13 @@ from __future__ import annotations
 from alpha_engine.formulaic_alphas.alpha_001 import compute_alpha_001
 from alpha_engine.formulaic_alphas.alpha_002 import compute_alpha_002
 from alpha_engine.formulaic_alphas.alpha_003 import compute_alpha_003
+from alpha_engine.formulaic_alphas.alpha_004 import compute_alpha_004
 
 FORMULAIC_ALPHA_REGISTRY = {
     "alpha_001": compute_alpha_001,
     "alpha_002": compute_alpha_002,
     "alpha_003": compute_alpha_003,
+    "alpha_004": compute_alpha_004,
 }
 
 
