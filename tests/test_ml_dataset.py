@@ -8,6 +8,7 @@ import pytest
 
 from ml_engine.dataset import (
     DEFAULT_ALPHA_COLS,
+    MODEL_HOLDOUT_ALPHA_COLS,
     REJECTED_ALPHA_COLS,
     add_trade_return_label,
     build_ml_dataset_from_symbol_dirs,
@@ -151,18 +152,20 @@ def test_summarize_ml_dataset_counts_complete_feature_rows(tmp_path: Path):
     assert train_row["rows"] == len(out)
     assert train_row["feature_complete_rows"] == len(out) - 1
 
-def test_default_ml_feature_set_excludes_rejected_alphas():
+def test_default_ml_feature_set_excludes_rejected_and_holdout_alphas():
+    assert "alpha_003" in MODEL_HOLDOUT_ALPHA_COLS
+    assert "alpha_004" in MODEL_HOLDOUT_ALPHA_COLS
     assert "alpha_007" in REJECTED_ALPHA_COLS
     assert "alpha_009" in REJECTED_ALPHA_COLS
 
+    assert "alpha_003" not in DEFAULT_ALPHA_COLS
+    assert "alpha_004" not in DEFAULT_ALPHA_COLS
     assert "alpha_007" not in DEFAULT_ALPHA_COLS
     assert "alpha_009" not in DEFAULT_ALPHA_COLS
 
     assert DEFAULT_ALPHA_COLS == (
         "alpha_001",
         "alpha_002",
-        "alpha_003",
-        "alpha_004",
         "alpha_005",
         "alpha_006",
         "alpha_008",

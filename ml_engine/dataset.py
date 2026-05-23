@@ -9,13 +9,12 @@ import pandas as pd
 STABLE_ALPHA_COLS: tuple[str, ...] = (
     "alpha_001",
     "alpha_002",
-    "alpha_003",
-    "alpha_004",
     "alpha_005",
     "alpha_006",
     "alpha_008",
     "alpha_010",
 )
+MODEL_HOLDOUT_ALPHA_COLS: tuple[str, ...] = ("alpha_003", "alpha_004")
 REJECTED_ALPHA_COLS: tuple[str, ...] = ("alpha_007", "alpha_009")
 DEFAULT_ALPHA_COLS: tuple[str, ...] = STABLE_ALPHA_COLS
 DEFAULT_TRADE_HORIZON = 3
