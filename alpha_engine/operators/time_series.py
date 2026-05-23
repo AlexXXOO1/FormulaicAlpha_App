@@ -173,3 +173,39 @@ def ts_delay_by_symbol(
     symbol_col: str = "symbol",
 ) -> pd.Series:
     return df.groupby(symbol_col, sort=False)[value_col].shift(periods)
+
+
+
+def rolling_min_by_symbol(
+    df: pd.DataFrame,
+    value_col: str,
+    window: int,
+    *,
+    symbol_col: str = "symbol",
+    min_periods: int | None = None,
+) -> pd.Series:
+    min_periods = window if min_periods is None else min_periods
+    return (
+        df.groupby(symbol_col, sort=False)[value_col]
+        .rolling(window, min_periods=min_periods)
+        .min()
+        .reset_index(level=0, drop=True)
+    )
+
+
+
+def rolling_max_by_symbol(
+    df: pd.DataFrame,
+    value_col: str,
+    window: int,
+    *,
+    symbol_col: str = "symbol",
+    min_periods: int | None = None,
+) -> pd.Series:
+    min_periods = window if min_periods is None else min_periods
+    return (
+        df.groupby(symbol_col, sort=False)[value_col]
+        .rolling(window, min_periods=min_periods)
+        .max()
+        .reset_index(level=0, drop=True)
+    )

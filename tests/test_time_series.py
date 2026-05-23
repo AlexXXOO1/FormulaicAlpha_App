@@ -66,3 +66,35 @@ def test_ts_delay_by_symbol():
     assert pd.isna(out.iloc[3])
     assert out.iloc[4] == 10.0
     assert out.iloc[5] == 20.0
+
+
+
+def test_rolling_min_max_by_symbol():
+    from alpha_engine.operators.time_series import (
+        rolling_max_by_symbol,
+        rolling_min_by_symbol,
+    )
+
+    df = pd.DataFrame(
+        {
+            "symbol": ["AAA", "AAA", "AAA", "BBB", "BBB", "BBB"],
+            "value": [3.0, 1.0, 2.0, 30.0, 10.0, 20.0],
+        }
+    )
+
+    min_out = rolling_min_by_symbol(df, "value", 2)
+    max_out = rolling_max_by_symbol(df, "value", 2)
+
+    assert pd.isna(min_out.iloc[0])
+    assert min_out.iloc[1] == 1.0
+    assert min_out.iloc[2] == 1.0
+    assert pd.isna(min_out.iloc[3])
+    assert min_out.iloc[4] == 10.0
+    assert min_out.iloc[5] == 10.0
+
+    assert pd.isna(max_out.iloc[0])
+    assert max_out.iloc[1] == 3.0
+    assert max_out.iloc[2] == 2.0
+    assert pd.isna(max_out.iloc[3])
+    assert max_out.iloc[4] == 30.0
+    assert max_out.iloc[5] == 20.0

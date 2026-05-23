@@ -8,6 +8,7 @@ from alpha_engine.formulaic_alphas.alpha_005 import compute_alpha_005
 from alpha_engine.formulaic_alphas.alpha_006 import compute_alpha_006
 from alpha_engine.formulaic_alphas.alpha_007 import compute_alpha_007
 from alpha_engine.formulaic_alphas.alpha_008 import compute_alpha_008
+from alpha_engine.formulaic_alphas.alpha_009 import compute_alpha_009
 
 FORMULAIC_ALPHA_REGISTRY = {
     "alpha_001": compute_alpha_001,
@@ -18,6 +19,7 @@ FORMULAIC_ALPHA_REGISTRY = {
     "alpha_006": compute_alpha_006,
     "alpha_007": compute_alpha_007,
     "alpha_008": compute_alpha_008,
+    "alpha_009": compute_alpha_009,
 }
 
 
