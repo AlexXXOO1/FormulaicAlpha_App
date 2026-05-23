@@ -21,6 +21,23 @@ def rolling_std_by_symbol(
     )
 
 
+def rolling_mean_by_symbol(
+    df: pd.DataFrame,
+    value_col: str,
+    window: int,
+    *,
+    symbol_col: str = "symbol",
+    min_periods: int | None = None,
+) -> pd.Series:
+    min_periods = window if min_periods is None else min_periods
+    return (
+        df.groupby(symbol_col, sort=False)[value_col]
+        .rolling(window, min_periods=min_periods)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+
+
 def ts_argmax_current_1_to_window(values: np.ndarray) -> float:
     if values.size == 0 or np.all(np.isnan(values)):
         return np.nan
