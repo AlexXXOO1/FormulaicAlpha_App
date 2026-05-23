@@ -895,7 +895,57 @@ def write_step10_factor_conclusion(
     if not step9_path.exists():
         raise FileNotFoundError(f"Missing Step9 file: {step9_path}")
 
-    df = pd.read_csv(step9_path)
+    try:
+        df = pd.read_csv(step9_path)
+    except pd.errors.EmptyDataError:
+        df = pd.DataFrame()
+
+    if df.empty:
+        conclusion = {
+            "factor_name": factor_name,
+            "factor_source": "101 Formulaic Alphas",
+            "factor_type": "reject",
+            "formula_summary": "",
+            "return_mode": "T0 signal, T+1 open buy, T+3/T+4 close evaluation",
+            "bucket_method": "train-defined global quantile buckets",
+            "bucket_rule": "none",
+            "valid_regime": "none",
+            "avoid_regime": "all",
+            "main_horizon": "none",
+            "secondary_horizon": "none",
+            "standalone_tradable": False,
+            "is_filter_factor": False,
+            "is_scoring_factor": False,
+            "avg_excess_pct": pd.NA,
+            "avg_win_ratio": pd.NA,
+            "avg_group_count": pd.NA,
+            "recommended_usage": "Reject at Step10 initial screen because Step9 has no train-defined bucket/regime evidence.",
+            "rejection_reason_as_standalone": "Step9 train-defined bucket regime check is empty.",
+            "next_action": "Manual override required; inspect Step6/Step8/Step9 before final decision.",
+        }
+
+        out_csv = output_dir / f"step10_{factor_name}_factor_conclusion.csv"
+        out_md = output_dir / f"step10_{factor_name}_factor_conclusion.md"
+
+        pd.DataFrame([conclusion]).to_csv(out_csv, index=False, encoding="utf-8-sig")
+        out_md.write_text(
+            "\n".join(
+                [
+                    f"# {factor_name} Factor Conclusion",
+                    "",
+                    "Step10 initial screen: reject",
+                    "",
+                    "Reason: Step9 train-defined bucket regime check is empty.",
+                    "",
+                    "Manual override is still required before using this factor.",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        print(f"saved: {out_csv}")
+        print(f"saved: {out_md}")
+        return
 
     required_cols = [
         "target",

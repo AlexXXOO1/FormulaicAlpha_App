@@ -1,32 +1,50 @@
 from __future__ import annotations
 
-from alpha_engine.formulaic_alphas.alpha_001 import compute_alpha_001
-from alpha_engine.formulaic_alphas.alpha_002 import compute_alpha_002
-from alpha_engine.formulaic_alphas.alpha_003 import compute_alpha_003
-from alpha_engine.formulaic_alphas.alpha_004 import compute_alpha_004
-from alpha_engine.formulaic_alphas.alpha_005 import compute_alpha_005
-from alpha_engine.formulaic_alphas.alpha_006 import compute_alpha_006
-from alpha_engine.formulaic_alphas.alpha_007 import compute_alpha_007
-from alpha_engine.formulaic_alphas.alpha_008 import compute_alpha_008
-from alpha_engine.formulaic_alphas.alpha_009 import compute_alpha_009
-from alpha_engine.formulaic_alphas.alpha_010 import compute_alpha_010
+import pkgutil
+import re
+from importlib import import_module
+from typing import Callable
 
-FORMULAIC_ALPHA_REGISTRY = {
-    "alpha_001": compute_alpha_001,
-    "alpha_002": compute_alpha_002,
-    "alpha_003": compute_alpha_003,
-    "alpha_004": compute_alpha_004,
-    "alpha_005": compute_alpha_005,
-    "alpha_006": compute_alpha_006,
-    "alpha_007": compute_alpha_007,
-    "alpha_008": compute_alpha_008,
-    "alpha_009": compute_alpha_009,
-    "alpha_010": compute_alpha_010,
-}
+_ALPHA_MODULE_PATTERN = re.compile(r"^alpha_\d{3}$")
+
+
+def _discover_formulaic_alphas() -> dict[str, Callable]:
+    package_name = __package__ or "alpha_engine.formulaic_alphas"
+    package = import_module(package_name)
+
+    registry: dict[str, Callable] = {}
+
+    for module_info in pkgutil.iter_modules(package.__path__):
+        alpha_name = module_info.name
+
+        if not _ALPHA_MODULE_PATTERN.fullmatch(alpha_name):
+            continue
+
+        module = import_module(f"{package_name}.{alpha_name}")
+        function_name = f"compute_{alpha_name}"
+        compute_func = getattr(module, function_name, None)
+
+        if not callable(compute_func):
+            raise AttributeError(
+                f"{package_name}.{alpha_name} must define callable {function_name}"
+            )
+
+        registry[alpha_name] = compute_func
+
+    return dict(sorted(registry.items()))
+
+
+FORMULAIC_ALPHA_REGISTRY = _discover_formulaic_alphas()
 
 
 def get_formulaic_alpha(name: str):
     key = name.strip().lower()
     if key not in FORMULAIC_ALPHA_REGISTRY:
-        raise KeyError(f"Unknown alpha: {name}. Available: {sorted(FORMULAIC_ALPHA_REGISTRY)}")
+        raise KeyError(
+            f"Unknown alpha: {name}. Available: {sorted(FORMULAIC_ALPHA_REGISTRY)}"
+        )
     return FORMULAIC_ALPHA_REGISTRY[key]
+
+
+def list_formulaic_alphas() -> list[str]:
+    return list(FORMULAIC_ALPHA_REGISTRY)
