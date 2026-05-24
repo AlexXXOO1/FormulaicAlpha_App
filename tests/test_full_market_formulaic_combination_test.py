@@ -154,3 +154,65 @@ def test_build_full_market_formulaic_combination_test_outputs_summaries(tmp_path
     assert "short_window_clear_negative" in result["combination_conclusion_summary"].columns
     assert not result["market_recent_period_summary"].empty
     assert "market_recent_20d" in set(result["market_recent_period_summary"]["period"])
+
+
+
+def test_build_full_market_formulaic_combination_test_regime_gate(tmp_path: Path) -> None:
+    market_dir = tmp_path / "market"
+    factor_dir = tmp_path / "factor"
+
+    _write_market_files(market_dir)
+    _write_factor_files(factor_dir)
+    research_root = _write_research_files(tmp_path)
+
+    dates = pd.date_range("2021-01-01", periods=8, freq="D")
+    regime_path = tmp_path / "custom_market_regime.csv"
+    pd.DataFrame(
+        {
+            "date": dates,
+            "market_regime": [
+                "range_bound",
+                "range_bound",
+                "range_bound",
+                "range_bound",
+                "strong_repair",
+                "strong_repair",
+                "strong_repair",
+                "strong_repair",
+            ],
+        }
+    ).to_csv(regime_path, index=False)
+
+    strong_only = build_full_market_formulaic_combination_test(
+        market_dir=market_dir,
+        factor_dir=factor_dir,
+        research_root=research_root,
+        manual_summary_path=research_root / "manual_factor_conclusion_summary.csv",
+        regime_path=regime_path,
+        output_dir=tmp_path / "strong_only",
+        factor_names=["alpha_005", "alpha_002"],
+        horizons=(3,),
+        start_date="2021-01-01",
+        end_date="2021-01-08",
+        allowed_regimes=["strong_repair"],
+    )
+
+    assert not strong_only["daily"].empty
+    assert set(strong_only["daily"]["market_regime"]) == {"strong_repair"}
+
+    exclude_strong = build_full_market_formulaic_combination_test(
+        market_dir=market_dir,
+        factor_dir=factor_dir,
+        research_root=research_root,
+        manual_summary_path=research_root / "manual_factor_conclusion_summary.csv",
+        regime_path=regime_path,
+        output_dir=tmp_path / "exclude_strong",
+        factor_names=["alpha_005", "alpha_002"],
+        horizons=(3,),
+        start_date="2021-01-01",
+        end_date="2021-01-08",
+        excluded_regimes=["strong_repair"],
+    )
+
+    assert not exclude_strong["daily"].empty
+    assert set(exclude_strong["daily"]["market_regime"]) == {"range_bound"}

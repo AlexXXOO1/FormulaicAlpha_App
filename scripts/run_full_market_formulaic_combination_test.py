@@ -9,6 +9,7 @@ from research.candidate_pool.full_market_formulaic_combination_test import (
     parse_combinations,
     parse_factor_names,
     parse_horizons,
+    parse_regimes,
 )
 
 
@@ -21,6 +22,8 @@ def main() -> None:
     parser.add_argument("--research-root", required=True)
     parser.add_argument("--manual-summary-path", required=True)
     parser.add_argument("--regime-path", required=True)
+    parser.add_argument("--allowed-regimes", default=None)
+    parser.add_argument("--excluded-regimes", default=None)
     parser.add_argument("--output-dir", required=True)
 
     parser.add_argument("--factors", default="alpha_005,alpha_002,alpha_006")
@@ -61,6 +64,8 @@ def main() -> None:
         recent_trading_days=args.recent_trading_days,
         min_candidate_count=args.min_candidate_count,
         max_candidate_count=args.max_candidate_count,
+        allowed_regimes=parse_regimes(args.allowed_regimes),
+        excluded_regimes=parse_regimes(args.excluded_regimes),
     )
 
 

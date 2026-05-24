@@ -316,6 +316,46 @@ def load_full_market_analysis_frame(
     return pd.concat(parts, ignore_index=True)
 
 
+def parse_regimes(value: str | None) -> list[str] | None:
+    return _parse_csv_list(value)
+
+
+def _normalize_regime_values(value) -> tuple[str, ...]:
+    if value is None:
+        return tuple()
+    if isinstance(value, str):
+        items = value.split(",")
+    else:
+        items = list(value)
+    return tuple(
+        str(x).strip()
+        for x in items
+        if str(x).strip()
+    )
+
+
+def _apply_regime_gate(
+    frame: pd.DataFrame,
+    *,
+    allowed_regimes=None,
+    excluded_regimes=None,
+) -> pd.DataFrame:
+    allowed = _normalize_regime_values(allowed_regimes)
+    excluded = _normalize_regime_values(excluded_regimes)
+
+    overlap = sorted(set(allowed) & set(excluded))
+    if overlap:
+        raise ValueError(f"allowed_regimes and excluded_regimes overlap: {overlap}")
+
+    out = frame
+    if allowed:
+        out = out[out["market_regime"].isin(allowed)]
+    if excluded:
+        out = out[~out["market_regime"].isin(excluded)]
+
+    return out.copy()
+
+
 def _dataset_from_year(year: pd.Series) -> pd.Series:
     return pd.Series(
         pd.NA,
@@ -875,6 +915,8 @@ def build_full_market_formulaic_combination_test(
     recent_trading_days: int = 120,
     min_candidate_count: int = 10,
     max_candidate_count: int = 80,
+    allowed_regimes: list[str] | tuple[str, ...] | str | None = None,
+    excluded_regimes: list[str] | tuple[str, ...] | str | None = None,
 ) -> dict[str, pd.DataFrame]:
     rules, rule_audit = load_manual_filter_rules(
         manual_summary_path,
@@ -906,6 +948,11 @@ def build_full_market_formulaic_combination_test(
     regime = load_regime_frame(regime_path)
     frame = frame.merge(regime, on="date", how="left")
     frame["market_regime"] = frame["market_regime"].fillna("unknown")
+    frame = _apply_regime_gate(
+        frame,
+        allowed_regimes=allowed_regimes,
+        excluded_regimes=excluded_regimes,
+    )
 
     frame = apply_base_tradability_filters(
         frame,
